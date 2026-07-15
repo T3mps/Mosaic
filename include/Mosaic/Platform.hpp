@@ -197,4 +197,7 @@
     #if defined(__ARM_NEON) || defined(__ARM_NEON__)
         #define MOSAIC_HAS_NEON 1
     #endif
+    #if defined(__ARM_FEATURE_CRC32)
+        #define MOSAIC_HAS_ARM_CRC32 1
+    #endif
 #endif

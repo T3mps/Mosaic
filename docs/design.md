@@ -75,11 +75,12 @@ and lets header-only consumers (Astra) stay header-only.
 |---|---|---|
 | `Mosaic/Platform` | arch/compiler/capability detection: `MOSAIC_ARCH_*`, `MOSAIC_COMPILER_*`, `MOSAIC_HAS_{SSE2,SSE42,AVX,AVX2,NEON,...}`, `MOSAIC_FORCEINLINE`, `MOSAIC_NODISCARD`, `MOSAIC_HAS_BUILTIN` | Astra has a mature `Platform.hpp`; Manifold2D hand-rolls a 3-macro subset inline in `Simd.hpp` |
 | `Mosaic/Jobs` | `IWorkScheduler` + `SerialWorkScheduler` (threading seam) | **both** Astra & Manifold2D ship their own -- and they've **diverged** (D3) |
-| `Mosaic/Log` | logging seam (`ILogger` sink) | Astra has `Log.hpp`; Manifold2D has none but needs one |
-| `Mosaic/Assert` | assert seam (`IAssertHandler` + `MOSAIC_ASSERT`) | Astra's assert is a bare `assert()` macro today -- pluggable version is net-new |
+| `Mosaic/Log` | logging seam: `LogSink` fn-ptr + `SetLogSink`/`SetLogLevel`, `MOSAIC_LOG_*` (compile-time floor + runtime level) | Astra has `Log.hpp` (the move origin); Manifold2D has none but needs one |
+| `Mosaic/Assert` | assert seam: `AssertHandler` + `MOSAIC_ASSERT`/`VERIFY`/`ENSURE` | Astra's `Assert.hpp` is the move origin; Manifold2D/Arcane use bare `assert()` |
 | `Mosaic/Simd/Wide` | numeric `f32w/i32w/b32w` lane vectors (+ Scalar/AVX2/NEON backends) | Manifold2D (determinism-critical) |
 | `Mosaic/Simd/Bits` | byte-match / `Int128`/`Int256` bitmap / hash toolbox | Astra (SwissTable/bloom acceleration) |
-| `Mosaic/Bits` | generic `PopCount`/`CountTrailingZeros`/`FindFirstSet` | Astra's bit-scan helpers (generic, not really SIMD) |
+| `Mosaic/Bits` | generic `PopCount`/`CountTrailingZeros`/`FindFirstSet`/`FindLastSet` | Astra's bit-scan helpers (generic, not really SIMD) |
+| `Mosaic/BitSet` | grow-only fixed-capacity bit set (b2BitSet equivalent) | Manifold2D's per-worker narrowphase scratch; generic enough to share |
 | `Mosaic/FunctionRef` | non-owning zero-alloc callable | Manifold2D has `FunctionRef`; Astra uses `std::function` in the scheduler seam (upgrade target) |
 
 **Namespace:** flat `Mosaic::` for primitives and seams (`Mosaic::IWorkScheduler`,
@@ -216,9 +217,56 @@ local copy only when its last includer has migrated (M0-strangler discipline).
 2. **SIMD**: move `Simd/Wide` (Manifold2D) + `Simd/Bits` + `Bits` (Astra) over
    `Platform`. Manifold2D's determinism gate (`~[gpu]` value-exact / the
    standalone suite) is the tripwire; Astra's SwissTable/bloom tests are theirs.
+   DONE. Both consumers deleted their copies; Manifold2D qualifies `Mosaic::Simd::`
+   directly, Astra keeps its vocabulary through a `namespace Simd = ::Mosaic::Simd`
+   re-export in `Core/Simd.hpp` (its 8 includers, several of them in-flight, did not
+   move). This also discharged step 1b's deferred Platform deletion in BOTH: Astra's
+   `Core/Platform.hpp` + the `Core/Base.hpp` attribute block are now one-line
+   re-exports of `MOSAIC_*`, and Manifold2D's Platform copy (the `ARCANE_SIMD_INLINE`
+   macro + raw `__AVX2__`/`__ARM_NEON` ladder) lived inside the Simd files that moved.
+   Backend selection is byte-identical in both (`MOSAIC_HAS_AVX2` <=> `__AVX2__`;
+   Astra's premake defines `__SSE2__`/`__SSE4_2__` on MSVC, which does not predefine
+   them). Mosaic's own suite grew a cross-validation gate for the moved code
+   (`BitsTest` + `SimdBitsTest`: every backend mask must equal the scalar reference).
 3. **Log + Assert** seams -- co-designed with Astra's in-flight work; land the
    injectable interfaces, wire the hosts' real impls.
+   LANDED + RECONCILED against Astra's finished implementation (`Mosaic/Log.hpp` +
+   `Mosaic/Assert.hpp`): fn-ptr+`void*` sink, `AssertAction Break/Continue` handler,
+   `MOSAIC_ASSERT` / `VERIFY` / `ENSURE` / `ENSURE_ALWAYS`, continuable debug-break.
+   The behaviours that matter, all matching Astra:
+   - **Break is gated on a debugger being ATTACHED, for BOTH the fatal and the
+     recoverable path** -- an unattended process must never execute a bare `int3`.
+     `FailFatal` breaks only under a debugger and then ALWAYS aborts (an unhandled
+     EXCEPTION_BREAKPOINT would kill it before it ever reached `abort()`: no CRT abort
+     report, no SIGABRT, a confusing exit code). `ASSERT` delegates to `FailFatal` --
+     one failure path, not two.
+   - **The default handler prints the stringized CONDITION**, not just the message.
+     `LogRecord` has no expression field (a log line has no business with one), so the
+     no-sink fallback formats to stderr itself rather than going through `StderrSink`,
+     which would silently drop exactly what plain `assert()` always printed.
+   - **A guard's report bypasses `SetLogLevel`.** It goes straight to the sink, so
+     `SetLogLevel(Off)` silences `MOSAIC_LOG_CRITICAL` but CANNOT suppress a failing
+     guard -- a fatal condition must not be suppressible by a logging setting.
+   - The default handler's category is **hard-coded**, never `MOSAIC_LOG_CATEGORY`:
+     that macro is redefinable per-TU, and baking a per-TU token into an inline
+     function body is an ODR violation.
+   - `ENSURE`'s fire-once flag is a `static std::atomic<bool>` exchange, so concurrent
+     failures at one site report once rather than racing.
+   ONE DELIBERATE DIFFERENCE from Astra: Mosaic's asserts are active on `!NDEBUG`
+   (Astra keys off `ASTRA_BUILD_DEBUG`). Mosaic is VENDORED into hosts that do not
+   define a Mosaic build flag -- keying off theirs would silently disable the `BitSet`
+   and `Simd/Bits` guards in a consumer's debug build, which is a regression against
+   the plain `assert()`s they replaced. `MOSAIC_ENABLE_ASSERTS` / `MOSAIC_DISABLE_ASSERTS`
+   force it either way.
+   HOST ADOPTION IS STILL OPEN: Astra keeps its own `Core/Log.hpp` + `Core/Assert.hpp`
+   (they are its published vocabulary). Convergence -- Astra re-exporting Mosaic's like
+   it does for Simd, Arcane wiring its logger as the sink, Manifold2D routing its bare
+   `assert()`s through `MOSAIC_ASSERT` -- is the next step.
 4. **Bit utilities / any remaining shared leaf** as a mop-up.
+   DONE for `BitSet`: moved out of Manifold2D (its `include/Manifold2D/Core/` is now
+   GONE -- every primitive it had lives in Mosaic), its unit test moved with it, and
+   `Manifold2DCoreTest.cpp` became `MosaicLinkSmokeTest.cpp`. Astra's `Delegate` and
+   its `Bitmap` container stay Astra-side (no speculative moves).
 
 Arcane picks Mosaic up transitively (it already consumes Astra + Manifold2D) and
 directly for anything it uses first-hand; its enki adapter retargets to
